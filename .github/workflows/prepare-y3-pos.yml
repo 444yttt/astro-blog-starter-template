@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 concurrency:
   group: y3-public-signing-preparation
@@ -36,6 +37,8 @@ jobs:
 
       - name: Prepare an encrypted one-time credential transport manifest
         shell: bash
+        env:
+          Y3_CHECK_TOKEN: ${{ github.token }}
         run: |
           set +x
           set -euo pipefail

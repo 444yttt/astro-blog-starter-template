@@ -344,8 +344,16 @@ def authorize(state):
     require((state / "owner-token").is_file(), "The one-time encrypted credential transfer timed out.")
     token = (state / "owner-token").read_text()
     require(not AUTH_DIR.exists(), "The fixed owner authentication directory already exists.")
-    create = subprocess.run(["sudo", "install", "-d", "-m", "700", "-o", str(os.getuid()), "-g", str(os.getgid()), str(AUTH_DIR)], capture_output=True)
-    require(create.returncode == 0, "The protected owner authentication directory could not be created.")
+    require(not AUTH_DIR.parent.is_symlink(), "The owner authentication parent must be a real directory.")
+    # install -d assigns the requested ownership only to its last component.
+    # Create the parent explicitly so the runner can remove the credential
+    # directory after use, including when Apple profile preparation fails.
+    for directory in (AUTH_DIR.parent, AUTH_DIR):
+        create = subprocess.run(["sudo", "install", "-d", "-m", "700", "-o", str(os.getuid()), "-g", str(os.getgid()), str(directory)], capture_output=True)
+        require(create.returncode == 0 and directory.is_dir()
+                and directory.stat().st_uid == os.getuid()
+                and not directory.stat().st_mode & 0o077,
+                "The protected owner authentication directory could not be created with runner ownership.")
     login = subprocess.run(["gh", "auth", "login", "--hostname", "github.com", "--with-token"],
                            input=token.encode(), env=cli_environment(), capture_output=True)
     require(login.returncode == 0 and (AUTH_DIR / "hosts.yml").is_file(),
@@ -450,14 +458,20 @@ def migrate():
             time.sleep(5)
         raise BootstrapError("The private signing migration timed out.")
     finally:
-        if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-        log.close()
+        try:
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                except ProcessLookupError:
+                    # The ephemeral worker can exit between poll() and killpg().
+                    pass
+        finally:
+            log.close()
 
 
 def stop_private_processes(state, names=("runner",)):
@@ -486,17 +500,25 @@ def stop_private_processes(state, names=("runner",)):
 
 def cleanup():
     state, challenge = paths()
+    local_failures = []
     if state.exists() and not state.is_symlink():
-        stop_private_processes(state)
+        try:
+            stop_private_processes(state)
+        except (BootstrapError, OSError, ValueError):
+            local_failures.append("temporary worker")
         token_path = state / "owner-token"
         if token_path.is_file() and not token_path.is_symlink():
-            token = token_path.read_text()
             try:
+                token = token_path.read_text()
                 run_path = state / "migration-run"
                 if run_path.is_file():
                     run = api(f"/repos/{PRIVATE_REPO}/actions/runs/{int(run_path.read_text())}", token)
                     if run.get("status") != "completed":
                         api(f"/repos/{PRIVATE_REPO}/actions/runs/{run['id']}/cancel", token, "POST")
+            except (BootstrapError, OSError, ValueError):
+                print("Temporary migration cancellation could not be confirmed by GitHub.", file=sys.stderr)
+            try:
+                token = token_path.read_text()
                 name_path = state / "runner-name"
                 if name_path.is_file():
                     name = name_path.read_text()
@@ -504,13 +526,18 @@ def cleanup():
                     for runner in runners:
                         if runner.get("name") == name:
                             api(f"/repos/{PRIVATE_REPO}/actions/runners/{runner['id']}", token, "DELETE")
-            except (BootstrapError, ValueError):
+            except (BootstrapError, OSError, ValueError):
                 print("Temporary runner cleanup could not be confirmed by GitHub; inspect the private runner settings.", file=sys.stderr)
-        shutil.rmtree(state)
-    if challenge.exists() and not challenge.is_symlink():
-        shutil.rmtree(challenge)
-    if AUTH_DIR.exists() and not AUTH_DIR.is_symlink():
-        shutil.rmtree(AUTH_DIR)
+    # Every protected location is attempted even if an earlier cleanup failed.
+    for label, directory in (("bootstrap state", state), ("encrypted challenge", challenge),
+                             ("owner authentication", AUTH_DIR)):
+        try:
+            if directory.exists() and not directory.is_symlink():
+                shutil.rmtree(directory)
+        except OSError:
+            local_failures.append(label)
+    if local_failures:
+        raise BootstrapError("Protected temporary cleanup could not complete for: " + ", ".join(local_failures) + ".")
 
 
 def main():

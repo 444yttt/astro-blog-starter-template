@@ -29,6 +29,7 @@ import urllib.request
 
 PUBLIC_REPO = "444yttt/Y3POSClient"
 BOOTSTRAP_REPO = "444yttt/astro-blog-starter-template"
+BOOTSTRAP_REPO_ID = 1216010419
 PRIVATE_REPO = "444yttt/Y3FloorGuide"
 PRIVATE_BRANCH = "y3-pos-client"
 PRIVATE_WORKFLOW = "migrate-client-signing.yml"
@@ -42,6 +43,10 @@ RUNNER_SHA256 = "af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d3
 
 class BootstrapError(Exception):
     """A message that never contains a remote response or credential value."""
+
+
+class PendingHandoff(Exception):
+    """The genuine publisher is still completing its bounded job."""
 
 
 def require(condition, message):
@@ -74,7 +79,8 @@ def guard():
             "Only the approved public app's manually dispatched main branch may prepare signing.")
     event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     repo = event.get("repository", {})
-    require(repo.get("full_name") == BOOTSTRAP_REPO and repo.get("private") is False,
+    require(repo.get("full_name") == BOOTSTRAP_REPO and repo.get("id") == BOOTSTRAP_REPO_ID
+            and repo.get("private") is False,
             "The preparation source must be the public repository hosting this iOS subproject.")
     sha = os.environ.get("GITHUB_SHA", "")
     require(re.fullmatch(r"[0-9a-f]{40}", sha), "The dispatched source SHA is invalid.")
@@ -237,6 +243,7 @@ def publish_handoff():
 def accept_handoff_check(check, transport, state, check_token):
     require(check.get("name") == "Y3 encrypted credential handoff " + transport["run_id"] + "-" + transport["run_attempt"]
             and check.get("head_sha") == transport["source_sha"] and check.get("app", {}).get("slug") == "github-actions"
+            and check.get("app", {}).get("id") == 15368
             and check.get("status") == "completed" and check.get("conclusion") == "neutral",
             "The handoff check does not match the trusted GitHub Actions producer and parent source.")
     details = re.fullmatch(r"Y3 transfer ([1-9][0-9]*)-([1-9][0-9]*)",
@@ -250,9 +257,44 @@ def accept_handoff_check(check, transport, state, check_token):
     require(run.get("path") == ".github/workflows/transfer-y3-signing.yml"
             and run.get("head_sha") == transport["source_sha"] and run.get("head_branch") == "main"
             and run.get("event") == "workflow_dispatch" and str(run.get("run_attempt")) == details[2]
-            and run.get("check_suite_id") == check.get("check_suite", {}).get("id")
             and run.get("actor", {}).get("login") == "444yttt" and run.get("actor", {}).get("id") == OWNER_ID,
             "The handoff producer must be the exact reviewed, owner-dispatched transfer workflow and suite.")
+    parent = api(f"/repos/{BOOTSTRAP_REPO}/actions/runs/{transport['run_id']}", check_token)
+    require(parent.get("head_sha") == transport["source_sha"]
+            and parent.get("path") == ".github/workflows/prepare-y3-pos.yml"
+            and parent.get("event") == "workflow_dispatch" and parent.get("head_branch") == "main"
+            and str(parent.get("run_attempt")) == transport["run_attempt"],
+            "The transfer must bind the original reviewed parent run and attempt.")
+    suite_id = check.get("check_suite", {}).get("id")
+    require(suite_id in (parent.get("check_suite_id"), run.get("check_suite_id")) and isinstance(suite_id, int),
+            "The handoff check must belong to a recognized parent or publisher suite.")
+    suite = api(f"/repos/{BOOTSTRAP_REPO}/check-suites/{suite_id}", check_token)
+    require(suite.get("id") == suite_id and suite.get("head_sha") == transport["source_sha"]
+            and suite.get("app", {}).get("id") == 15368 and suite.get("app", {}).get("slug") == "github-actions"
+            and suite.get("repository", {}).get("id") == BOOTSTRAP_REPO_ID
+            and suite.get("repository", {}).get("full_name") == BOOTSTRAP_REPO
+            and suite.get("repository", {}).get("owner", {}).get("id") == OWNER_ID,
+            "The recognized check suite must match the actual repository, source and GitHub Actions app.")
+    if run.get("status") != "completed":
+        raise PendingHandoff()
+    require(run.get("conclusion") == "success", "The native transfer workflow did not complete successfully.")
+    jobs = api(f"/repos/{BOOTSTRAP_REPO}/actions/runs/{details[1]}/jobs", check_token).get("jobs", [])
+    publishers = [job for job in jobs if job.get("name") == "transfer-ciphertext"]
+    if not publishers:
+        raise PendingHandoff()
+    require(len(publishers) == 1, "The transfer must have exactly one consistent publisher job.")
+    publisher = publishers[0]
+    if publisher.get("status") != "completed":
+        raise PendingHandoff()
+    require(publisher.get("conclusion") == "success", "The exact publisher job did not complete successfully.")
+    steps = [step for step in publisher.get("steps", [])
+             if step.get("name") == "Publish only the encrypted handoff for the exact parent"]
+    if not steps:
+        raise PendingHandoff()
+    require(len(steps) == 1, "The transfer must have exactly one consistent handoff step.")
+    if steps[0].get("status") != "completed":
+        raise PendingHandoff()
+    require(steps[0].get("conclusion") == "success", "The exact handoff step did not complete successfully.")
     encoded = check.get("output", {}).get("summary", "")
     require(isinstance(encoded, str) and 0 < len(encoded) <= 22000,
             "The encrypted handoff check exceeds its bounded size.")
@@ -288,12 +330,14 @@ def authorize(state):
         for check in checks:
             if check.get("id") in seen:
                 continue
-            seen.add(check.get("id"))
             try:
                 accept_handoff_check(check, transport, state, check_token)
                 if (state / "owner-token").is_file():
                     break
+            except PendingHandoff:
+                continue
             except (BootstrapError, ValueError, OSError, subprocess.SubprocessError):
+                seen.add(check.get("id"))
                 print("An invalid encrypted handoff was ignored; the original challenge remains active.", flush=True)
         if not (state / "owner-token").is_file():
             time.sleep(3)

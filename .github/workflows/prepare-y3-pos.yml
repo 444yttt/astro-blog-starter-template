@@ -1,0 +1,65 @@
+name: Prepare the public Y3 POS Client subproject signing
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_bootstrap_sha:
+        description: Exact reviewed main commit to run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: y3-public-signing-preparation
+  cancel-in-progress: false
+
+jobs:
+  prepare-public-app-signing:
+    if: >-
+      github.repository == '444yttt/astro-blog-starter-template' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/main' &&
+      github.sha == inputs.expected_bootstrap_sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      Y3_EXPECTED_BOOTSTRAP_SHA: ${{ inputs.expected_bootstrap_sha }}
+      Y3_PRIVATE_SOURCE_SHA: '67837110f114bf10c9e38ff6914d8c1db2755da1'
+    steps:
+      - name: Checkout the exact reviewed public app subproject commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prepare an encrypted one-time credential transport manifest
+        shell: bash
+        run: |
+          set +x
+          set -euo pipefail
+          python3 ci/y3-bootstrap/bootstrap.py request
+
+      - name: Save only the encrypted exact-run transport manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: y3-signing-challenge-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/y3-signing-challenge/challenge.json.age
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Create the dedicated app repository and prepare its signing Secrets
+        shell: bash
+        run: |
+          set +x
+          set -euo pipefail
+          python3 ci/y3-bootstrap/bootstrap.py authorize-and-migrate
+
+      - name: Remove private transport, owner authentication and runner files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +x
+          set -euo pipefail
+          python3 ci/y3-bootstrap/bootstrap.py cleanup

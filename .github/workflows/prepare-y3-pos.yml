@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   checks: write
 
 concurrency:
@@ -54,6 +55,8 @@ jobs:
 
       - name: Create the dedicated app repository and prepare its signing Secrets
         shell: bash
+        env:
+          Y3_CHECK_TOKEN: ${{ github.token }}
         run: |
           set +x
           set -euo pipefail

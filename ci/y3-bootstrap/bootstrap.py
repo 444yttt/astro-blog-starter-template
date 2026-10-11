@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import http.server
 import json
 import os
 import pathlib
@@ -35,8 +34,6 @@ PRIVATE_BRANCH = "y3-pos-client"
 PRIVATE_WORKFLOW = "migrate-client-signing.yml"
 OWNER_ID = 267067583
 AUTH_DIR = pathlib.Path("/workspace/scratch/y3-github-ci-auth")
-CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-linux-amd64"
-CLOUDFLARED_SHA256 = "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db"
 AGE_URL = "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz"
 AGE_SHA256 = "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"
 RUNNER_URL = "https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz"
@@ -130,29 +127,6 @@ def download_extract(url, digest, directory):
         archive.unlink(missing_ok=True)
 
 
-def start_private_process(command, state, name, **kwargs):
-    environment = dict(os.environ)
-    environment.pop("Y3_CHECK_TOKEN", None)
-    kwargs.setdefault("env", environment)
-    with (state / (name + ".log")).open("wb") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, **kwargs)
-    protected_write(state / (name + "-process"), str(process.pid))
-    return process
-
-
-def download_binary(url, digest, output):
-    try:
-        with urllib.request.urlopen(url, timeout=120) as response:
-            binary = response.read(64 * 1024 * 1024)
-        require(hashlib.sha256(binary).hexdigest() == digest,
-                "An official transport binary failed its pinned SHA-256 check.")
-        protected_write(output, binary)
-        output.chmod(0o700)
-    except (urllib.error.URLError, TimeoutError):
-        raise BootstrapError("The pinned official transport binary could not be downloaded.") from None
-
-
 def request_challenge():
     guard()
     state, challenge = paths()
@@ -176,29 +150,9 @@ def request_challenge():
     transport = {"bootstrap_repository": BOOTSTRAP_REPO, "destination_repository": PUBLIC_REPO,
                  "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
                  "source_sha": os.environ["GITHUB_SHA"], "recipient": ephemeral_recipient,
-                 "capability_path": "/" + secrets.token_urlsafe(32), "expires_at": time.time() + 600}
+                 "handoff_nonce": secrets.token_urlsafe(32), "expires_at": time.time() + 600,
+                 "transfer_workflow": "transfer-y3-signing.yml"}
     protected_write(state / "transport-state.json", json.dumps(transport))
-    download_binary(CLOUDFLARED_URL, CLOUDFLARED_SHA256, state / "cloudflared")
-    server = start_private_process([sys.executable, str(pathlib.Path(__file__).resolve()), "serve-transport"], state, "server")
-    deadline = time.time() + 30
-    while not (state / "server-port").is_file() and time.time() < deadline:
-        require(server.poll() is None, "The bounded local transport receiver could not start.")
-        time.sleep(0.2)
-    require((state / "server-port").is_file(), "The bounded local transport receiver timed out.")
-    port = int((state / "server-port").read_text())
-    tunnel = start_private_process([str(state / "cloudflared"), "tunnel", "--no-autoupdate", "--protocol", "http2",
-                 "--url", "http://127.0.0.1:" + str(port)], state, "tunnel")
-    deadline = time.time() + 60
-    tunnel_origin = None
-    while time.time() < deadline:
-        require(tunnel.poll() is None, "The ciphertext-only HTTPS transport could not start.")
-        matches = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", (state / "tunnel.log").read_text(errors="replace"))
-        if matches:
-            tunnel_origin = matches[0]
-            break
-        time.sleep(0.5)
-    require(tunnel_origin, "The ciphertext-only HTTPS transport endpoint timed out.")
-    transport["callback_url"] = tunnel_origin + transport["capability_path"]
     human_challenge = json.dumps(transport).encode()
     result = subprocess.run([str(age_directory / "age" / "age"), "--encrypt", "--recipient", recipient,
                              "--output", str(challenge / "challenge.json.age")],
@@ -206,7 +160,7 @@ def request_challenge():
     require(result.returncode == 0, "The human authorization challenge could not be encrypted.")
     # The runtime can read canonical GitHub Checks while its artifact CDN may
     # be unavailable. This duplicate contains ciphertext only, never the
-    # plaintext manifest, capability path or credential.
+    # plaintext manifest, handoff nonce or credential.
     encrypted_challenge = (challenge / "challenge.json.age").read_bytes()
     require(len(encrypted_challenge) <= 16384, "The encrypted transport manifest exceeds its bounded size.")
     check_token = os.environ.get("Y3_CHECK_TOKEN", "")
@@ -246,62 +200,105 @@ def verify_owner_token(token):
             "The credential must belong to 444yttt and have the approved repo/workflow scopes.")
 
 
-def serve_transport():
+def publish_handoff():
     guard()
-    state, _ = paths()
-    transport = json.loads((state / "transport-state.json").read_text())
-    class Receiver(http.server.BaseHTTPRequestHandler):
-        def setup(self):
-            super().setup()
-            self.connection.settimeout(5)
-
-        def log_message(self, _format, *args):
-            pass
-
-        def do_POST(self):
-            self.connection.settimeout(5)
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                require(self.path == transport["capability_path"] and 0 < length <= 16384
-                        and time.time() < transport["expires_at"] and not (state / "owner-token").exists(),
-                        "The one-time ciphertext request is invalid.")
-                encrypted = self.rfile.read(length)
-                require(len(encrypted) == length, "The ciphertext request is incomplete.")
-                result = subprocess.run([str(state / "age-tool" / "age" / "age"), "--decrypt", "--identity",
-                                 str(state / "transport-identity.txt")], input=encrypted, capture_output=True, timeout=15)
-                require(result.returncode == 0, "The ciphertext request could not be authenticated.")
-                payload = json.loads(result.stdout)
-                require(all(payload.get(key) == transport[key] for key in ("bootstrap_repository", "destination_repository",
-                             "run_id", "run_attempt", "source_sha", "recipient", "capability_path")),
-                        "The encrypted credential does not match this exact reviewed run.")
-                token = payload.get("oauth_token")
-                verify_owner_token(token)
-                protected_write(state / "owner-token", token)
-                self.send_response(204)
-            except (BootstrapError, OSError, ValueError, subprocess.SubprocessError):
-                # Invalid requests never consume a valid challenge; no error body
-                # echoes ciphertext, decrypted material or upstream API output.
-                self.send_response(403)
-            self.end_headers()
-    server = http.server.HTTPServer(("127.0.0.1", 0), Receiver)
-    server.timeout = 1
-    protected_write(state / "server-port", str(server.server_address[1]))
+    parent_run = os.environ.get("Y3_PARENT_RUN_ID", "")
+    parent_attempt = os.environ.get("Y3_PARENT_ATTEMPT", "")
+    require(re.fullmatch(r"[1-9][0-9]{0,19}", parent_run)
+            and re.fullmatch(r"[1-9][0-9]{0,3}", parent_attempt),
+            "The encrypted handoff must identify its exact parent run and attempt.")
+    encoded = os.environ.get("Y3_ENCRYPTED_PAYLOAD", "")
+    require(0 < len(encoded) <= 22000, "The encrypted workflow input exceeds its bounded size.")
     try:
-        while time.time() < transport["expires_at"] and not (state / "owner-token").is_file():
-            server.handle_request()
-    finally:
-        server.server_close()
+        encrypted = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        raise BootstrapError("The handoff input must be Base64 age ciphertext.") from None
+    require(0 < len(encrypted) <= 16384 and encrypted.startswith(b"age-encryption.org/v1\n"),
+            "The handoff input must be a bounded age ciphertext, never plaintext credentials.")
+    check_token = os.environ.get("Y3_CHECK_TOKEN", "")
+    require(check_token, "The transfer step requires its bounded GitHub Checks write credential.")
+    parent = api(f"/repos/{BOOTSTRAP_REPO}/actions/runs/{parent_run}", check_token)
+    require(parent.get("head_sha") == os.environ["GITHUB_SHA"]
+            and parent.get("path") == ".github/workflows/prepare-y3-pos.yml"
+            and parent.get("event") == "workflow_dispatch" and parent.get("head_branch") == "main"
+            and str(parent.get("run_attempt")) == parent_attempt and parent.get("status") == "in_progress",
+            "The encrypted handoff must target the active reviewed parent preparation run.")
+    run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+    api(f"/repos/{BOOTSTRAP_REPO}/check-runs", check_token, "POST", {
+        "name": "Y3 encrypted credential handoff " + parent_run + "-" + parent_attempt,
+        "head_sha": os.environ["GITHUB_SHA"], "status": "completed", "conclusion": "neutral",
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "details_url": f"https://github.com/{BOOTSTRAP_REPO}/actions/runs/{run_id}/attempts/{attempt}",
+        "output": {"title": "Y3 transfer " + run_id + "-" + attempt,
+                   "summary": encoded}})
+    print("The bounded encrypted handoff was published to its exact parent run.")
+
+
+def accept_handoff_check(check, transport, state, check_token):
+    require(check.get("name") == "Y3 encrypted credential handoff " + transport["run_id"] + "-" + transport["run_attempt"]
+            and check.get("head_sha") == transport["source_sha"] and check.get("app", {}).get("slug") == "github-actions"
+            and check.get("status") == "completed" and check.get("conclusion") == "neutral",
+            "The handoff check does not match the trusted GitHub Actions producer and parent source.")
+    details = re.fullmatch(r"Y3 transfer ([1-9][0-9]*)-([1-9][0-9]*)",
+                           check.get("output", {}).get("title", ""))
+    require(details, "The handoff check must identify the exact native transfer run.")
+    require(check.get("details_url") in (
+                f"https://github.com/{BOOTSTRAP_REPO}/actions/runs/{details[1]}/attempts/{details[2]}",
+                f"https://github.com/{BOOTSTRAP_REPO}/runs/{check.get('id')}"),
+            "The handoff check must use its canonical GitHub check or transfer run URL.")
+    run = api(f"/repos/{BOOTSTRAP_REPO}/actions/runs/{details[1]}", check_token)
+    require(run.get("path") == ".github/workflows/transfer-y3-signing.yml"
+            and run.get("head_sha") == transport["source_sha"] and run.get("head_branch") == "main"
+            and run.get("event") == "workflow_dispatch" and str(run.get("run_attempt")) == details[2]
+            and run.get("check_suite_id") == check.get("check_suite", {}).get("id")
+            and run.get("actor", {}).get("login") == "444yttt" and run.get("actor", {}).get("id") == OWNER_ID,
+            "The handoff producer must be the exact reviewed, owner-dispatched transfer workflow and suite.")
+    encoded = check.get("output", {}).get("summary", "")
+    require(isinstance(encoded, str) and 0 < len(encoded) <= 22000,
+            "The encrypted handoff check exceeds its bounded size.")
+    encrypted = base64.b64decode(encoded, validate=True)
+    require(0 < len(encrypted) <= 16384 and encrypted.startswith(b"age-encryption.org/v1\n"),
+            "The encrypted handoff check is not a bounded age ciphertext.")
+    result = subprocess.run([str(state / "age-tool" / "age" / "age"), "--decrypt", "--identity",
+                            str(state / "transport-identity.txt")], input=encrypted, capture_output=True, timeout=15)
+    require(result.returncode == 0, "The encrypted handoff could not be authenticated.")
+    payload = json.loads(result.stdout)
+    require(isinstance(payload, dict), "The encrypted handoff must contain a bounded credential object.")
+    require(time.time() < transport["expires_at"] and all(payload.get(key) == transport[key]
+            for key in ("bootstrap_repository", "destination_repository", "run_id", "run_attempt", "source_sha", "recipient", "handoff_nonce")),
+            "The encrypted credential does not match this exact reviewed challenge.")
+    token = payload.get("oauth_token")
+    require(isinstance(token, str) and re.fullmatch(r"gho_[A-Za-z0-9]{36,}", token),
+            "The encrypted input did not contain the previously approved OAuth credential.")
+    print("::add-mask::" + token, flush=True)
+    verify_owner_token(token)
+    protected_write(state / "owner-token", token)
 
 
 def authorize(state):
     transport = json.loads((state / "transport-state.json").read_text())
-    print("Waiting for the encrypted transfer of the already approved owner credential.", flush=True)
+    print("Waiting for the exact-run encrypted GitHub handoff check.", flush=True)
+    check_token = os.environ.get("Y3_CHECK_TOKEN", "")
+    require(check_token, "The parent requires its bounded GitHub Checks read credential.")
+    name = "Y3 encrypted credential handoff " + transport["run_id"] + "-" + transport["run_attempt"]
+    seen = set()
     while time.time() < transport["expires_at"] and not (state / "owner-token").is_file():
-        time.sleep(1)
+        query = urllib.parse.urlencode({"check_name": name, "filter": "all", "per_page": 100})
+        checks = api(f"/repos/{BOOTSTRAP_REPO}/commits/{transport['source_sha']}/check-runs?{query}", check_token).get("check_runs", [])
+        for check in checks:
+            if check.get("id") in seen:
+                continue
+            seen.add(check.get("id"))
+            try:
+                accept_handoff_check(check, transport, state, check_token)
+                if (state / "owner-token").is_file():
+                    break
+            except (BootstrapError, ValueError, OSError, subprocess.SubprocessError):
+                print("An invalid encrypted handoff was ignored; the original challenge remains active.", flush=True)
+        if not (state / "owner-token").is_file():
+            time.sleep(3)
     require((state / "owner-token").is_file(), "The one-time encrypted credential transfer timed out.")
     token = (state / "owner-token").read_text()
-    print("::add-mask::" + token, flush=True)
-    verify_owner_token(token)
     require(not AUTH_DIR.exists(), "The fixed owner authentication directory already exists.")
     create = subprocess.run(["sudo", "install", "-d", "-m", "700", "-o", str(os.getuid()), "-g", str(os.getgid()), str(AUTH_DIR)], capture_output=True)
     require(create.returncode == 0, "The protected owner authentication directory could not be created.")
@@ -310,7 +307,6 @@ def authorize(state):
     require(login.returncode == 0 and (AUTH_DIR / "hosts.yml").is_file(),
             "The owner credential could not be bound to the protected GitHub CLI configuration.")
     (AUTH_DIR / "hosts.yml").chmod(0o600)
-    stop_private_processes(state, ("server", "tunnel"))
     (state / "transport-identity.txt").unlink(missing_ok=True)
     return token
 
@@ -420,7 +416,7 @@ def migrate():
         log.close()
 
 
-def stop_private_processes(state, names=("server", "tunnel", "runner")):
+def stop_private_processes(state, names=("runner",)):
     for name in names:
         pid_path = state / (name + "-process")
         if not pid_path.is_file():
@@ -476,13 +472,13 @@ def cleanup():
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("request", "authorize-and-migrate", "serve-transport", "cleanup"))
+    parser.add_argument("mode", choices=("request", "authorize-and-migrate", "publish-handoff", "cleanup"))
     args = parser.parse_args()
     try:
         if args.mode == "request":
             request_challenge()
-        elif args.mode == "serve-transport":
-            serve_transport()
+        elif args.mode == "publish-handoff":
+            publish_handoff()
         elif args.mode == "authorize-and-migrate":
             def interrupted(_signum, _frame):
                 raise BootstrapError("The one-time signing preparation was interrupted.")

@@ -1,0 +1,34 @@
+name: Check Y3 POS Client subproject
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator-build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Checkout the source on main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Compile with the iOS Simulator SDK
+        working-directory: Clients/Y3POSClient
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(xcodebuild -version)"
+          printf '%s\n' "$version"
+          [[ "$(printf '%s\n' "$version" | sed -n 's/^Xcode //p')" == 16.4 ]]
+          xcodebuild -quiet -project Y3Client.xcodeproj -scheme Y3Client \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/y3pos-simulator-check" \
+            CODE_SIGNING_ALLOWED=NO build

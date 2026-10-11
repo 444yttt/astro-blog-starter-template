@@ -1,0 +1,26 @@
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+__pycache__/
+*.pyc
+*.p12
+*.p8
+*.mobileprovision
+*.keychain*
+*.xcarchive/
+*.ipa
+
+# Public-source repository: never commit signing material or local outputs.
+artifacts/
+.venv/
+.env
+.env.*
+*.pem
+*.key
+*.cer
+*.der
+*.age
+*.agekey
+delivery-identity.txt
